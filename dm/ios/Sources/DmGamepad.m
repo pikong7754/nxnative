@@ -463,13 +463,17 @@ static void read_pad(GCExtendedGamepad *g) {
             if (mo.sensorsRequireManualActivation) mo.sensorsActive = YES;
             mo.valueChangedHandler = ^(GCMotion *m) {
                 // Launcher-adjustable calibration (dm/games/settings.tsv): read on every callback, the controller can connect before the launcher applies its env.
-                // Defaults calibrated on an NS Pro Controller with TOTK bow aiming: pitch and yaw flipped = a 180 deg turn about the vertical axis.
+                // Defaults calibrated on an NS Pro Controller with TOTK (bow, Ultrahand cursor and held object all verified): a 180 deg turn about the forward axis.
                 const char *e;
-                int ix = (e = getenv("DM_GYRO_INV_X")) ? atoi(e) : 1, iy = (e = getenv("DM_GYRO_INV_Y")) ? atoi(e) : 1, iz = (e = getenv("DM_GYRO_INV_Z")) ? atoi(e) : 0;
+                int ix = (e = getenv("DM_GYRO_INV_X")) ? atoi(e) : 1, iy = (e = getenv("DM_GYRO_INV_Y")) ? atoi(e) : 0, iz = (e = getenv("DM_GYRO_INV_Z")) ? atoi(e) : 1;
                 float gain = (e = getenv("DM_GYRO_GAIN")) ? (float)atof(e) : 1.5f;
                 double sx = ix ? -1 : 1, sy = iy ? -1 : 1, sz = iz ? -1 : 1;
                 float acc[3] = { (float)(sx * m.acceleration.x), (float)(sy * m.acceleration.y), (float)(sz * m.acceleration.z) };
-                float gyro[3] = { (float)(sx * m.rotationRate.x / (2 * M_PI) * gain), (float)(sy * m.rotationRate.y / (2 * M_PI) * gain), (float)(sz * m.rotationRate.z / (2 * M_PI) * gain) };   // rad/s -> revolutions/s
+                // The angular velocity's own axes: a MEMS gyro's per-axis signs need not match its accelerometer frame. TOTK aims the bow by the
+                // orientation (sx/sy/sz above) but swings an Ultrahand-held object by the rotation rate, which needs its own flip switches.
+                int vx = (e = getenv("DM_GYROV_INV_X")) ? atoi(e) : 0, vy = (e = getenv("DM_GYROV_INV_Y")) ? atoi(e) : 0, vz = (e = getenv("DM_GYROV_INV_Z")) ? atoi(e) : 1;
+                double tx = vx ? -1 : 1, ty = vy ? -1 : 1, tz = vz ? -1 : 1;
+                float gyro[3] = { (float)(tx * m.rotationRate.x / (2 * M_PI) * gain), (float)(ty * m.rotationRate.y / (2 * M_PI) * gain), (float)(tz * m.rotationRate.z / (2 * M_PI) * gain) };   // rad/s -> revolutions/s
                 // iPadOS fuses no attitude for a controller (GCMotion.attitude stays the identity), so track the orientation here: integrate the gyro
                 // and nudge it toward the accelerometer's gravity near rest (a complementary filter: no drift, just a slow yaw wander with no reference).
                 static double q[4], pt; static int qset;

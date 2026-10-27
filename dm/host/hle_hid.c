@@ -308,14 +308,20 @@ enum { SIX_PERIOD_NS = 5000000 };
 #define SHAKE_REV 1.5
 static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
 // Real six-axis motion from the front end (iOS DmGamepad.m: a connected controller's GCMotion, or the device's own CMDeviceMotion). src 0 = the console
-// (handheld), 1 = player 1's controller. acc in G, gyro in revolutions / s, t the host now_ns() of the sample. The angle integrates the gyro between updates;
+// (handheld), 1 = player 1's controller. acc in G, gyro in revolutions / s, t the host now_ns() of the sample. The angle integrates the gyro, wrapped, as on the real sensor;
 // a sample older than MOT_FRESH_NS counts as no sensor and the synthetic rest / shake below stands in. Without any front-end motion everything is as before.
 static pthread_mutex_t g_mot_mu = PTHREAD_MUTEX_INITIALIZER;
-static float g_mot_acc[2][3], g_mot_gyro[2][3], g_mot_quat[2][4]; static uint64_t g_mot_t[2];
+static float g_mot_acc[2][3], g_mot_gyro[2][3], g_mot_quat[2][4], g_mot_ang[2][3]; static uint64_t g_mot_t[2];
 #define MOT_FRESH_NS 300000000
 void dm_motion_set(int src, const float acc[3], const float gyro[3], const float quat[4], uint64_t t) {
     if ((unsigned)src > 1) return;
     pthread_mutex_lock(&g_mot_mu);
+    // angle: the gyro's accumulated integral, in revolutions and wrapping like the real sensor's (games read its deltas; the
+    // gravity-corrected dir above would be wrong here: its euler angles of a combined rotation are not the integrated rates)
+    if (g_mot_t[src]) {
+        double dt = (double)(t - g_mot_t[src]) / 1e9; if (dt > 0.05) dt = 0.05;
+        for (int i = 0; i < 3; i++) { float a = g_mot_ang[src][i] + (float)(gyro[i] * dt); a -= floorf(a + 0.5f); g_mot_ang[src][i] = a; }
+    }
     memcpy(g_mot_acc[src], acc, 3 * sizeof(float)); memcpy(g_mot_gyro[src], gyro, 3 * sizeof(float)); memcpy(g_mot_quat[src], quat, 4 * sizeof(float)); g_mot_t[src] = t;
     pthread_mutex_unlock(&g_mot_mu);
     static uint64_t lg[2]; if (t - lg[src] > 1000000000) { lg[src] = t; LOG("[dm] motion src%d acc %.2f %.2f %.2f gyro %.3f %.3f %.3f", src, acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]); }
@@ -325,18 +331,25 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes, int mot) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;   // IsConnected
-    if (mot >= 0) {   // measured motion: acc / gyro as reported; dir from the front end's fused attitude quaternion (gravity-corrected, no drift), angle its ZYX euler in revolutions
+    if (mot >= 0) {   // measured motion: acc / gyro as reported; dir from the front end's fused attitude quaternion (gravity-corrected, no drift), angle the gyro's integral
         pthread_mutex_lock(&g_mot_mu);
-        memcpy(s->acc, g_mot_acc[mot], 3 * sizeof(float)); memcpy(s->gyro, g_mot_gyro[mot], 3 * sizeof(float));
+        memcpy(s->acc, g_mot_acc[mot], 3 * sizeof(float)); memcpy(s->gyro, g_mot_gyro[mot], 3 * sizeof(float)); memcpy(s->angle, g_mot_ang[mot], 3 * sizeof(float));
         float qx = g_mot_quat[mot][0], qy = g_mot_quat[mot][1], qz = g_mot_quat[mot][2], qw = g_mot_quat[mot][3];
         pthread_mutex_unlock(&g_mot_mu);
         double n = sqrt((double)qx * qx + (double)qy * qy + (double)qz * qz + (double)qw * qw); if (n < 1e-9) { qx = qy = qz = 0; qw = 1; } else { qx /= n; qy /= n; qz /= n; qw /= n; }
         s->dir[0] = 1 - 2 * (qy * qy + qz * qz); s->dir[1] = 2 * (qx * qy - qw * qz);     s->dir[2] = 2 * (qx * qz + qw * qy);
         s->dir[3] = 2 * (qx * qy + qw * qz);     s->dir[4] = 1 - 2 * (qx * qx + qz * qz); s->dir[5] = 2 * (qy * qz - qw * qx);
         s->dir[6] = 2 * (qx * qz - qw * qy);     s->dir[7] = 2 * (qy * qz + qw * qx);     s->dir[8] = 1 - 2 * (qx * qx + qy * qy);
-        s->angle[0] = (float)(atan2(2 * ((double)qw * qx + (double)qy * qz), 1 - 2 * ((double)qx * qx + (double)qy * qy)) / (2 * M_PI));
-        s->angle[1] = (float)(asin(fmax(-1.0, fmin(1.0, 2 * ((double)qw * qy - (double)qz * qx)))) / (2 * M_PI));
-        s->angle[2] = (float)(atan2(2 * ((double)qw * qz + (double)qx * qy), 1 - 2 * ((double)qy * qy + (double)qz * qz)) / (2 * M_PI));
+        // A 180 deg twist of the body frame about one axis negates the matrix's other two columns. Aim readers (TOTK's bow) see
+        // only the pointing column, so such a twist is invisible to them, but readers of the full matrix (TOTK's Ultrahand
+        // holding an object) come out reversed: DM_GRIP_TWIST=x/y/z corrects it (off otherwise).
+        static int twist = -1;
+        if (twist < 0) { const char *e = getenv("DM_GRIP_TWIST"); twist = !e || !*e || !strcmp(e, "off") ? 3 : *e == 't' ? 4 : *e == 'x' ? 0 : *e == 'y' ? 1 : 2; }
+        if (twist == 4) {   // transposed layout: rows as the body axes in world (the convention Ryujinx's matrix copy implies)
+            float t1 = s->dir[1]; s->dir[1] = s->dir[3]; s->dir[3] = t1;
+            t1 = s->dir[2]; s->dir[2] = s->dir[6]; s->dir[6] = t1;
+            t1 = s->dir[5]; s->dir[5] = s->dir[7]; s->dir[7] = t1;
+        } else if (twist < 3) for (int a = 0; a < 3; a++) if (a != twist) for (int r = 0; r < 3; r++) s->dir[r * 3 + a] = -s->dir[r * 3 + a];
         return;
     }
     s->acc[2] = -1;
